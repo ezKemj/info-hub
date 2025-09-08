@@ -1,0 +1,33 @@
+name: Build Info Hub
+on:
+  schedule:
+    - cron: "*/30 * * * *"   # 每30分钟
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: |
+          pip install feedparser beautifulsoup4 lxml python-slugify
+
+      - name: Build
+        run: |
+          python scripts/build.py
+
+      - name: Commit data
+        run: |
+          git config user.name "bot"
+          git config user.email "bot@example.com"
+          git add -A
+          git commit -m "update: $(date -u +'%Y-%m-%dT%H:%M:%SZ')" || echo "no changes"
+          git push
