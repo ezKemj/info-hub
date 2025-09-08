@@ -160,5 +160,156 @@ def render_index_html(items):
         f'<br><em>{html.escape(i.get("summary","")[:200])}</em></li>'
         for i in items[:300]
     )
-    return f"""<!doctype html><meta charset="utf-8"><title>InfoHub</title>
-<style>body{{font:14px/1.6 -apple-system,BlinkMacSystemFont,Segoe UI,Roboto,Helvetica,Arial;max-width:860px
+        return f"""<!doctype html><meta charset="utf-8"><title>InfoHub</title>
+<style>body{{font:14px/1.6 -apple-system,BlinkMacSystemFont,Segoe UI,Roboto,Helvetica,Arial;max-width:860px;margin:24px auto;padding:0 12px}}li{{margin:12px 0}}</style>
+<h1>InfoHub 聚合</h1>
+<p><a href="feed.xml">聚合RSS</a> | <a href="feed.json">聚合JSON</a> | <a href="status.html">源状态</a></p>
+<ul>{lis}</ul>"""
+
+def render_status_html(state):
+    rows = []
+    for url, rec in sorted(state.items()):
+        rows.append(f"<tr><td>{html.escape(url)}</td>"
+                    f"<td>{rec.get('consecutive_failures',0)}</td>"
+                    f"<td>{html.escape(str(rec.get('last_success')))}</td>"
+                    f"<td>{html.escape(str(rec.get('last_error')))}</td>"
+                    f"<td>{html.escape(str(rec.get('disabled_until')))}</td></tr>")
+    table = "\n".join(rows)
+    return f"""<!doctype html><meta charset="utf-8"><title>源状态</title>
+<style>table{{border-collapse:collapse}}td,th{{border:1px solid #ccc;padding:6px 8px}}</style>
+<h1>源状态面板</h1>
+<table>
+<tr><th>源URL</th><th>连续失败</th><th>最后成功</th><th>最后错误</th><th>禁用至</th></tr>
+{table}
+</table>"""
+
+def render_atom_feed(items, feed_title="InfoHub 聚合", feed_link="./", feed_id="infohub-agg"):
+    updated = (items[0]["published"] if items else now_utc().isoformat())
+    entries_xml = []
+    for i in items[:200]:
+        entries_xml.append(f"""
+  <entry>
+    <id>tag:{html.escape(i['id'])}</id>
+    <title>{html.escape(i['title'])}</title>
+    <link href="{html.escape(i['link'])}"/>
+    <updated>{html.escape(i['published'])}</updated>
+    <summary>{html.escape(i.get('summary',''))}</summary>
+    <author><name>{html.escape(i.get('source_domain',''))}</name></author>
+  </entry>""")
+    entries = "\n".join(entries_xml)
+    return f"""<?xml version="1.0" encoding="utf-8"?>
+<feed xmlns="http://www.w3.org/2005/Atom">
+  <id>{feed_id}</id>
+  <title>{html.escape(feed_title)}</title>
+  <updated>{html.escape(updated)}</updated>
+  <link href="{html.escape(feed_link)}"/>
+{entries}
+</feed>"""
+
+def main():
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    start = now_utc()
+    log_name = f"build-{start.strftime('%Y%m%dT%H%M%SZ')}.log"
+    log_path = LOG_DIR / log_name
+
+    def log(msg):
+        print(msg)
+        with log_path.open("a", encoding="utf-8") as f:
+            f.write(msg + "\n")
+
+    rules = load_rules()
+    core_sources, secondary_sources = load_sources()
+
+    # 判断运行频率：通过环境变量或时间判断
+    # 这里简单用环境变量 RUN_GROUP 控制（在 Actions 中设置）
+    run_group = os.environ.get("RUN_GROUP", "core")
+    sources = core_sources if run_group == "core" else secondary_sources
+
+    state_path = STATE_DIR / "sources.json"
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    if state_path.exists():
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+    else:
+        state = {}
+
+    items = []
+    fetched = 0
+    skipped = 0
+
+    for url in sources:
+        n = now_utc()
+        skip, reason = should_skip_by_state(state, url, n)
+        if skip:
+            log(f"SKIP [{url}] due to state: {reason}")
+            skipped += 1
+            continue
+
+        log(f"FETCH [{url}] ...")
+        entries, err = fetch_feed(url)
+        if err:
+            log(f"ERROR [{url}]: {err}")
+            update_state_on_result(state, url, ok=False, error_msg=err, now=n)
+            continue
+
+        update_state_on_result(state, url, ok=True, error_msg=None, now=n)
+        fetched += 1
+
+        for e in entries:
+            it = normalize_entry(url, e)
+            if pass_filters(it, rules):
+                items.append(it)
+
+    # 去重
+    uniq = {it["id"]: it for it in items}
+    items = list(uniq.values())
+
+    # 加载上次 latest，合并未过期项
+    latest_idx = DATA_DIR / "latest" / "index.json"
+    prev = []
+    if latest_idx.exists():
+        try:
+            prev = json.loads(latest_idx.read_text(encoding="utf-8"))
+        except Exception:
+            prev = []
+    nowt = now_utc()
+    alive = [it for it in items if not is_expired(it, rules, nowt)]
+
+    prev_map = {i["id"]: i for i in prev}
+    for pid, pit in prev_map.items():
+        if pid not in {i["id"] for i in alive}:
+            if not is_expired(pit, rules, nowt):
+                alive.append(pit)
+
+    alive.sort(key=lambda x: x.get("published",""), reverse=True)
+
+    latest_dir = DATA_DIR / "latest"
+    archive_dir = DATA_DIR / "archive" / nowt.strftime("%Y-%m")
+    latest_dir.mkdir(parents=True, exist_ok=True)
+    archive_dir.mkdir(parents=True, exist_ok=True)
+
+    write_json(latest_idx, alive)
+    with (archive_dir / "snapshot.ndjson").open("a", encoding="utf-8") as f:
+        for it in items:
+            f.write(json.dumps(it, ensure_ascii=False) + "\n")
+
+    PUB_DIR.mkdir(parents=True, exist_ok=True)
+    (PUB_DIR / "index.html").write_text(render_index_html(alive), encoding="utf-8")
+    (PUB_DIR / "feed.json").write_text(json.dumps(alive[:200], ensure_ascii=False, indent=2), encoding="utf-8")
+    (PUB_DIR / "feed.xml").write_text(render_atom_feed(alive), encoding="utf-8")
+    (PUB_DIR / "status.html").write_text(render_status_html(state), encoding="utf-8")
+
+    write_json(state_path, state)
+    summary = {
+        "time": start.isoformat(),
+        "run_group": run_group,
+        "fetched_sources": fetched,
+        "skipped_sources": skipped,
+        "total_sources": len(sources),
+        "alive_items": len(alive),
+        "new_items_this_run": len(items),
+    }
+    write_json(LOG_DIR / "summary.json", summary)
+    log(f"SUMMARY {json.dumps(summary, ensure_ascii=False)}")
+
+if __name__ == "__main__":
+    main()
