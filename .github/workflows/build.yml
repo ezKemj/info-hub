@@ -1,33 +1,50 @@
-name: Build Info Hub
+name: Build & Deploy InfoHub
+
 on:
   schedule:
-    - cron: "*/30 * * * *"   # 每30分钟
+    - cron: "*/15 * * * *"   # 高频源：每15分钟
+    - cron: "0 */2 * * *"    # 低频源：每2小时
   workflow_dispatch:
+
+permissions:
+  contents: write
+  pages: write
+  id-token: write
 
 jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout
+      - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Setup Python
+      - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      - name: Install deps
+      - name: Install dependencies
         run: |
-          pip install feedparser beautifulsoup4 lxml python-slugify
+          pip install feedparser beautifulsoup4 lxml python-dateutil requests
 
-      - name: Build
+      - name: Build site
+        env:
+          RUN_GROUP: core   # 高频任务时改成 core，低频任务时改成 secondary
         run: |
           python scripts/build.py
 
-      - name: Commit data
-        run: |
-          git config user.name "bot"
-          git config user.email "bot@example.com"
-          git add -A
-          git commit -m "update: $(date -u +'%Y-%m-%dT%H:%M:%SZ')" || echo "no changes"
-          git push
+      - name: Upload artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: public
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
