@@ -1,139 +1,164 @@
-
-import os, re, json, time, hashlib, datetime as dt
-import feedparser
+import os, re, json, time, hashlib, html, traceback
 from pathlib import Path
+from datetime import datetime, timedelta, timezone
+import feedparser
+import requests
 from bs4 import BeautifulSoup
+from dateutil import parser as dateparser
 
 ROOT = Path(__file__).resolve().parents[1]
-SRC = ROOT / "sources"
-DATA = ROOT / "data"
-PUB  = ROOT / "public"
-RULE = ROOT / "rules"
+SRC_DIR = ROOT / "sources"
+RULE_DIR = ROOT / "rules"
+DATA_DIR = ROOT / "data"
+STATE_DIR = ROOT / "state"
+LOG_DIR = ROOT / "logs"
+PUB_DIR = ROOT / "public"
 
-WHITELIST = {w.strip() for w in (RULE/"whitelist.txt").read_text(encoding="utf-8").splitlines() if w.strip()}
-BLACKLIST = {w.strip() for w in (RULE/"blacklist.txt").read_text(encoding="utf-8").splitlines() if w.strip()}
-PERSIST_DOMAINS = {w.strip() for w in (RULE/"persistent_domains.txt").read_text(encoding="utf-8").splitlines() if w.strip()}
+TIMEOUT = 20
+USER_AGENT = "InfoHubBot/1.0 (+https://github.com)"
+DEFAULT_TTL_DAYS = 30
+FAIL_DISABLE_AFTER = 3
+DISABLE_DURATION = timedelta(hours=24)
+
+def now_utc():
+    return datetime.utcnow().replace(tzinfo=timezone.utc)
+
+def read_lines(p: Path):
+    if not p.exists(): return []
+    return [x.strip() for x in p.read_text(encoding="utf-8", errors="ignore").splitlines() if x.strip() and not x.strip().startswith("#")]
 
 def load_sources():
-    urls = []
-    # very simple OPML/line parser (assumes one url per line if not opml)
-    for line in (SRC/"rsshub.txt").read_text(encoding="utf-8").splitlines():
-        line=line.strip()
-        if line and not line.startswith("#"):
-            urls.append(line)
-    # OPML minimal parse
-    opml = (SRC/"official.opml").read_text(encoding="utf-8", errors="ignore")
-    urls += re.findall(r'xmlUrl="([^"]+)"', opml)
-    return sorted(set(urls))
+    core = read_lines(SRC_DIR / "core.txt")
+    secondary = read_lines(SRC_DIR / "secondary.txt")
+    return core, secondary
+
+def load_rules():
+    return {
+        "whitelist": set(read_lines(RULE_DIR / "whitelist.txt")),
+        "blacklist": set(read_lines(RULE_DIR / "blacklist.txt")),
+        "persistent_domains": set(read_lines(RULE_DIR / "persistent_domains.txt")),
+    }
+
+def domain_of(url):
+    m = re.match(r"^https?://([^/]+)", url.strip(), flags=re.I)
+    return m.group(1).lower() if m else ""
 
 def html_to_text(s):
     return BeautifulSoup(s or "", "lxml").get_text(" ", strip=True)
 
-def norm_item(src, e):
+def normalize_entry(src_url, e):
     title = (getattr(e, "title", "") or "").strip()
     link  = (getattr(e, "link" , "") or "").strip()
-    summ  = html_to_text(getattr(e, "summary", "") or getattr(e, "description",""))
-    pub   = getattr(e, "published", "") or getattr(e, "updated","") or ""
-    srcdom = re.sub(r"^https?://","", src).split("/")[0]
-    raw = {
-        "source": src, "source_domain": srcdom, "title": title, "link": link,
-        "summary": summ, "published": pub
-    }
-    sig = hashlib.sha1((title + "|" + link + "|" + srcdom).encode("utf-8")).hexdigest()
-    raw["id"] = sig
-    return raw
-
-def is_white(text):
-    return any(k in text for k in WHITELIST) if WHITELIST else True
-
-def is_black(text):
-    return any(k in text for k in BLACKLIST) if BLACKLIST else False
-
-def is_persistent(item):
-    return item["source_domain"] in PERSIST_DOMAINS
-
-def is_expired(item, now):
-    if is_persistent(item):
-        return False
-    # classify by keywords for TTL
-    txt = (item["title"] + " " + item["summary"])
-    if any(k in txt for k in ["预警","停诊","延误","封闭","中断","限流","通告","调整","变更"]):
-        ttl = dt.timedelta(hours=72)
-    else:
-        ttl = dt.timedelta(days=14)
-    # published parse (fallback to now-0)
+    summary_html = getattr(e, "summary", "") or getattr(e, "description", "")
+    summary_text = html.unescape(html_to_text(summary_html))
+    pub_raw = getattr(e, "published", "") or getattr(e, "updated", "") or ""
     try:
-        pub = feedparser.parse("data:,x")._parse_date(item["published"])  # use feedparser's parser
-        pub_dt = dt.datetime(*pub[:6], tzinfo=dt.timezone.utc) if pub else now
+        pub_dt = dateparser.parse(pub_raw)
+        if not pub_dt.tzinfo:
+            pub_dt = pub_dt.replace(tzinfo=timezone.utc)
+        pub_iso = pub_dt.astimezone(timezone.utc).isoformat()
     except Exception:
-        pub_dt = now
-    return (now - pub_dt) > ttl
+        pub_iso = now_utc().isoformat()
 
-def main():
-    now = dt.datetime.utcnow().replace(tzinfo=dt.timezone.utc)
-    urls = load_sources()
-    latest_dir = DATA / "latest"
-    archive_dir = DATA / "archive" / now.strftime("%Y-%m")
-    latest_dir.mkdir(parents=True, exist_ok=True)
-    archive_dir.mkdir(parents=True, exist_ok=True)
+    sdom = domain_of(src_url)
+    sig_src = f"{title}|{link}|{sdom}"
+    sig = hashlib.sha1(sig_src.encode("utf-8")).hexdigest()
+    return {
+        "id": sig,
+        "title": title,
+        "link": link,
+        "summary": summary_text,
+        "published": pub_iso,
+        "source": src_url,
+        "source_domain": sdom
+    }
 
-    # load previous state
-    prev = {}
-    if (latest_dir/"index.json").exists():
-        prev = {i["id"]: i for i in json.loads((latest_dir/"index.json").read_text("utf-8"))}
+def pass_filters(item, rules):
+    text = f"{item['title']} {item['summary']}"
+    wl = rules["whitelist"]
+    bl = rules["blacklist"]
+    if wl and not any(k in text for k in wl):
+        return False
+    if bl and any(k in text for k in bl):
+        return False
+    return True
 
-    items = []
-    for u in urls:
-        feed = feedparser.parse(u)
-        for e in feed.entries:
-            it = norm_item(u, e)
-            text = (it["title"] + " " + it["summary"])
-            if not is_white(text) or is_black(text):
-                continue
-            items.append(it)
+def is_persistent(item, rules):
+    dom = item["source_domain"]
+    return any(dom == d or dom.endswith("." + d) for d in rules["persistent_domains"])
 
-    # de-dup
-    uniq = {}
-    for it in items:
-        uniq[it["id"]] = it
-    items = list(uniq.values())
+def is_expired(item, rules, now):
+    if is_persistent(item, rules): return False
+    ttl = timedelta(days=DEFAULT_TTL_DAYS)
+    try:
+        pub = dateparser.parse(item["published"])
+        if not pub.tzinfo: pub = pub.replace(tzinfo=timezone.utc)
+    except Exception:
+        pub = now
+    return (now - pub) > ttl
 
-    # expire filter
-    alive, expired = [], []
-    for it in items:
-        if is_expired(it, now):
-            expired.append(it)
-        else:
-            alive.append(it)
+def safe_request(url):
+    try:
+        resp = requests.get(url, headers={"User-Agent": USER_AGENT}, timeout=TIMEOUT, allow_redirects=True)
+        resp.raise_for_status()
+        return resp
+    except requests.exceptions.Timeout:
+        # 超时重试一次
+        resp = requests.get(url, headers={"User-Agent": USER_AGENT}, timeout=TIMEOUT, allow_redirects=True)
+        resp.raise_for_status()
+        return resp
 
-    # merge with prev (keep previously alive unless expired now)
-    for pid, pit in prev.items():
-        if pid not in uniq and not is_expired(pit, now):
-            alive.append(pit)
+def fetch_feed(url):
+    try:
+        resp = safe_request(url)
+        content = resp.text
+        feed = feedparser.parse(content)
+        if feed.bozo and not feed.entries:
+            return [], f"parse error: {getattr(feed, 'bozo_exception', '')}"
+        return feed.entries, None
+    except Exception as e:
+        return [], f"{type(e).__name__}: {str(e)}"
 
-    # sort by published desc (fallback to id)
-    alive.sort(key=lambda x: (x.get("published",""), x["id"]), reverse=True)
+def should_skip_by_state(state, url, now):
+    rec = state.get(url)
+    if not rec: return False, None
+    disabled_until = rec.get("disabled_until")
+    if disabled_until:
+        try:
+            du = dateparser.parse(disabled_until)
+        except Exception:
+            du = now
+        if now < du:
+            return True, f"disabled_until {disabled_until}"
+    return False, None
 
-    # write outputs
-    (latest_dir/"index.json").write_text(json.dumps(alive, ensure_ascii=False, indent=2), "utf-8")
-    with (archive_dir/"snapshot.ndjson").open("a", encoding="utf-8") as f:
-        for it in items:
-            f.write(json.dumps(it, ensure_ascii=False) + "\n")
+def update_state_on_result(state, url, ok, error_msg, now):
+    rec = state.get(url, {
+        "last_success": None, "last_error": None,
+        "consecutive_failures": 0, "disabled_until": None
+    })
+    if ok:
+        rec["last_success"] = now.isoformat()
+        rec["last_error"] = None
+        rec["consecutive_failures"] = 0
+        rec["disabled_until"] = None
+    else:
+        rec["last_error"] = f"{now.isoformat()} {error_msg}"
+        rec["consecutive_failures"] = rec.get("consecutive_failures", 0) + 1
+        if rec["consecutive_failures"] >= FAIL_DISABLE_AFTER:
+            rec["disabled_until"] = (now + DISABLE_DURATION).isoformat()
+    state[url] = rec
 
-    # very small html & json feed
-    PUB.mkdir(parents=True, exist_ok=True)
-    # index.html (ul list)
+def write_json(path: Path, obj):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(obj, ensure_ascii=False, indent=2), encoding="utf-8")
+
+def render_index_html(items):
     lis = "\n".join(
-        f'<li><a href="{i["link"]}" target="_blank">{i["title"]}</a> '
-        f'<small>({i["source_domain"]})</small><br><em>{i.get("summary","")[:160]}</em></li>'
-        for i in alive[:200]
+        f'<li><a href="{i["link"]}" target="_blank">{html.escape(i["title"])}</a> '
+        f'<small>({html.escape(i["source_domain"])}, {html.escape(i["published"])})</small>'
+        f'<br><em>{html.escape(i.get("summary","")[:200])}</em></li>'
+        for i in items[:300]
     )
-    html = f"""<!doctype html><meta charset="utf-8"><title>InfoHub</title>
-<style>body{{font:14px/1.6 -apple-system,BlinkMacSystemFont,Segoe UI,Roboto,Helvetica,Arial;max-width:860px;margin:24px auto;padding:0 12px}}li{{margin:10px 0}}</style>
-<h1>InfoHub（权威源聚合）</h1>
-<ul>{lis}</ul>"""
-    (PUB/"index.html").write_text(html, "utf-8")
-    (PUB/"feed.json").write_text(json.dumps(alive[:200], ensure_ascii=False, indent=2), "utf-8")
-
-if __name__ == "__main__":
-    main()
+    return f"""<!doctype html><meta charset="utf-8"><title>InfoHub</title>
+<style>body{{font:14px/1.6 -apple-system,BlinkMacSystemFont,Segoe UI,Roboto,Helvetica,Arial;max-width:860px
