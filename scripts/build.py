@@ -20,17 +20,22 @@ DEFAULT_TTL_DAYS = 30
 FAIL_DISABLE_AFTER = 3
 DISABLE_DURATION = timedelta(hours=24)
 
+
 def now_utc():
     return datetime.utcnow().replace(tzinfo=timezone.utc)
 
+
 def read_lines(p: Path):
     if not p.exists(): return []
-    return [x.strip() for x in p.read_text(encoding="utf-8", errors="ignore").splitlines() if x.strip() and not x.strip().startswith("#")]
+    return [x.strip() for x in p.read_text(encoding="utf-8", errors="ignore").splitlines() if
+            x.strip() and not x.strip().startswith("#")]
+
 
 def load_sources():
     core = read_lines(SRC_DIR / "core.txt")
     secondary = read_lines(SRC_DIR / "secondary.txt")
     return core, secondary
+
 
 def load_rules():
     return {
@@ -39,16 +44,19 @@ def load_rules():
         "persistent_domains": set(read_lines(RULE_DIR / "persistent_domains.txt")),
     }
 
+
 def domain_of(url):
     m = re.match(r"^https?://([^/]+)", url.strip(), flags=re.I)
     return m.group(1).lower() if m else ""
 
+
 def html_to_text(s):
     return BeautifulSoup(s or "", "lxml").get_text(" ", strip=True)
 
+
 def normalize_entry(src_url, e):
     title = (getattr(e, "title", "") or "").strip()
-    link  = (getattr(e, "link" , "") or "").strip()
+    link = (getattr(e, "link", "") or "").strip()
     summary_html = getattr(e, "summary", "") or getattr(e, "description", "")
     summary_text = html.unescape(html_to_text(summary_html))
     pub_raw = getattr(e, "published", "") or getattr(e, "updated", "") or ""
@@ -73,6 +81,7 @@ def normalize_entry(src_url, e):
         "source_domain": sdom
     }
 
+
 def pass_filters(item, rules):
     text = f"{item['title']} {item['summary']}"
     wl = rules["whitelist"]
@@ -83,9 +92,11 @@ def pass_filters(item, rules):
         return False
     return True
 
+
 def is_persistent(item, rules):
     dom = item["source_domain"]
     return any(dom == d or dom.endswith("." + d) for d in rules["persistent_domains"])
+
 
 def is_expired(item, rules, now):
     if is_persistent(item, rules): return False
@@ -96,6 +107,7 @@ def is_expired(item, rules, now):
     except Exception:
         pub = now
     return (now - pub) > ttl
+
 
 def safe_request(url):
     try:
@@ -108,6 +120,7 @@ def safe_request(url):
         resp.raise_for_status()
         return resp
 
+
 def fetch_feed(url):
     try:
         resp = safe_request(url)
@@ -118,6 +131,7 @@ def fetch_feed(url):
         return feed.entries, None
     except Exception as e:
         return [], f"{type(e).__name__}: {str(e)}"
+
 
 def should_skip_by_state(state, url, now):
     rec = state.get(url)
@@ -131,6 +145,7 @@ def should_skip_by_state(state, url, now):
         if now < du:
             return True, f"disabled_until {disabled_until}"
     return False, None
+
 
 def update_state_on_result(state, url, ok, error_msg, now):
     rec = state.get(url, {
@@ -149,15 +164,17 @@ def update_state_on_result(state, url, ok, error_msg, now):
             rec["disabled_until"] = (now + DISABLE_DURATION).isoformat()
     state[url] = rec
 
+
 def write_json(path: Path, obj):
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(obj, ensure_ascii=False, indent=2), encoding="utf-8")
+
 
 def render_index_html(items):
     lis = "\n".join(
         f'<li><a href="{i["link"]}" target="_blank">{html.escape(i["title"])}</a> '
         f'<small>({html.escape(i["source_domain"])}, {html.escape(i["published"])})</small>'
-        f'<br><em>{html.escape(i.get("summary","")[:200])}</em></li>'
+        f'<br><em>{html.escape(i.get("summary", "")[:200])}</em></li>'
         for i in items[:300]
     )
     return f"""<!doctype html><meta charset="utf-8"><title>InfoHub</title>
@@ -166,11 +183,12 @@ def render_index_html(items):
 <p><a href="feed.xml">聚合RSS</a> | <a href="feed.json">聚合JSON</a> | <a href="status.html">源状态</a></p>
 <ul>{lis}</ul>"""
 
+
 def render_status_html(state):
     rows = []
     for url, rec in sorted(state.items()):
         rows.append(f"<tr><td>{html.escape(url)}</td>"
-                    f"<td>{rec.get('consecutive_failures',0)}</td>"
+                    f"<td>{rec.get('consecutive_failures', 0)}</td>"
                     f"<td>{html.escape(str(rec.get('last_success')))}</td>"
                     f"<td>{html.escape(str(rec.get('last_error')))}</td>"
                     f"<td>{html.escape(str(rec.get('disabled_until')))}</td></tr>")
@@ -183,6 +201,7 @@ def render_status_html(state):
 {table}
 </table>"""
 
+
 def render_atom_feed(items, feed_title="InfoHub 聚合", feed_link="./", feed_id="infohub-agg"):
     updated = (items[0]["published"] if items else now_utc().isoformat())
     entries_xml = []
@@ -193,8 +212,8 @@ def render_atom_feed(items, feed_title="InfoHub 聚合", feed_link="./", feed_id
     <title>{html.escape(i['title'])}</title>
     <link href="{html.escape(i['link'])}"/>
     <updated>{html.escape(i['published'])}</updated>
-    <summary>{html.escape(i.get('summary',''))}</summary>
-    <author><name>{html.escape(i.get('source_domain',''))}</name></author>
+    <summary>{html.escape(i.get('summary', ''))}</summary>
+    <author><name>{html.escape(i.get('source_domain', ''))}</name></author>
   </entry>""")
     entries = "\n".join(entries_xml)
     return f"""<?xml version="1.0" encoding="utf-8"?>
@@ -205,6 +224,7 @@ def render_atom_feed(items, feed_title="InfoHub 聚合", feed_link="./", feed_id
   <link href="{html.escape(feed_link)}"/>
 {entries}
 </feed>"""
+
 
 def main():
     LOG_DIR.mkdir(parents=True, exist_ok=True)
@@ -280,7 +300,7 @@ def main():
             if not is_expired(pit, rules, nowt):
                 alive.append(pit)
 
-    alive.sort(key=lambda x: x.get("published",""), reverse=True)
+    alive.sort(key=lambda x: x.get("published", ""), reverse=True)
 
     latest_dir = DATA_DIR / "latest"
     archive_dir = DATA_DIR / "archive" / nowt.strftime("%Y-%m")
@@ -310,6 +330,7 @@ def main():
     }
     write_json(LOG_DIR / "summary.json", summary)
     log(f"SUMMARY {json.dumps(summary, ensure_ascii=False)}")
+
 
 if __name__ == "__main__":
     main()
