@@ -160,7 +160,7 @@ def render_index_html(items):
         f'<br><em>{html.escape(i.get("summary","")[:200])}</em></li>'
         for i in items[:300]
     )
-        return f"""<!doctype html><meta charset="utf-8"><title>InfoHub</title>
+    return f"""<!doctype html><meta charset="utf-8"><title>InfoHub</title>
 <style>body{{font:14px/1.6 -apple-system,BlinkMacSystemFont,Segoe UI,Roboto,Helvetica,Arial;max-width:860px;margin:24px auto;padding:0 12px}}li{{margin:12px 0}}</style>
 <h1>InfoHub 聚合</h1>
 <p><a href="feed.xml">聚合RSS</a> | <a href="feed.json">聚合JSON</a> | <a href="status.html">源状态</a></p>
